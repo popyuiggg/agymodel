@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Antigravity 端点与速率检测</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app-layout">
+    <!-- 左侧会话导航栏 -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <div class="brand-logo">AG</div>
+          <div class="brand-text">
+            <h1>端点检测台</h1>
+            <p>Endpoint &amp; TPS Inspector</p>
+          </div>
+        </div>
+        <div class="sidebar-filters">
+          <div class="seg-control" id="sourceFilter">
+            <button type="button" class="seg-btn active" data-source="all">全部</button>
+            <button type="button" class="seg-btn" data-source="App">App</button>
+            <button type="button" class="seg-btn" data-source="CLI">CLI</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="conv-list" id="convList">
+        <div class="empty-hint">正在读取会话列表...</div>
+      </div>
+    </aside>
+
+    <!-- 右侧主视图 -->
+    <main class="main-panel">
+      <!-- 顶部栏 -->
+      <header class="topbar">
+        <div class="topbar-title">
+          <div class="title-row">
+            <span class="source-tag" id="curSourceTag">App</span>
+            <h2 id="curTitle">正在加载会话...</h2>
+          </div>
+          <div class="meta-row">
+            <span class="mono-id" id="curId" title="点击复制完整会话 ID">-</span>
+            <span class="dot-sep">·</span>
+            <span id="curUpdatedAt">-</span>
+          </div>
+        </div>
+
+        <div class="topbar-actions">
+          <div class="auto-refresh-group">
+            <span class="status-dot" id="pollDot"></span>
+            <select id="pollSelect" class="select-clean" title="自动刷新间隔">
+              <option value="2000" selected>自动刷新 2s</option>
+              <option value="5000">自动刷新 5s</option>
+              <option value="0">手动刷新</option>
+            </select>
+          </div>
+          <button type="button" class="btn-clean" id="refreshBtn" title="立即刷新">
+            ↻ 刷新
+          </button>
+          <button type="button" class="btn-clean" id="themeBtn" title="切换明暗主题">
+            🌙 深色
+          </button>
+        </div>
+      </header>
+
+      <!-- 核心指标概览卡片 -->
+      <section class="metrics-grid">
+        <!-- 卡片 1: 真实后端端点 -->
+        <div class="metric-card highlight-card">
+          <div class="metric-label">
+            <span>后端真实调用端点 (Backend Endpoint)</span>
+            <span class="consistency-pill" id="statConsistent">全程一致</span>
+          </div>
+          <div class="metric-primary mono" id="statBackendEndpoint">-</div>
+          <div class="metric-footer">
+            <span>内部枚举: <strong class="mono" id="statModelEnum">-</strong></span>
+          </div>
+        </div>
+
+        <!-- 卡片 2: 客户端配置模型 -->
+        <div class="metric-card">
+          <div class="metric-label">
+            <span>前端配置模型 (Client Model)</span>
+            <span class="sub-pill" id="statNonGemini">Gemini 原生</span>
+          </div>
+          <div class="metric-primary mono" id="statClientModel">-</div>
+          <div class="metric-footer">
+            <span>共 <strong id="statTotalTurns">0</strong> 轮推理记录</span>
+            <span id="statTotalDuration">总耗时 0s</span>
+          </div>
+        </div>
+
+        <!-- 卡片 3: 生成速率与首字延迟 -->
+        <div class="metric-card">
+          <div class="metric-label">
+            <span>生成速率 (TPS) 与首字延迟</span>
+            <span class="sub-pill mono" id="statPeakTps">峰值 -</span>
+          </div>
+          <div class="metric-dual">
+            <div>
+              <div class="dual-val mono accent-amber" id="statLatestTps">-</div>
+              <div class="dual-cap">最新端到端 TPS</div>
+            </div>
+            <div class="dual-divider"></div>
+            <div>
+              <div class="dual-val mono" id="statAvgTps">-</div>
+              <div class="dual-cap">平均 TPS (流式 <span id="statAvgStreamTps">-</span>)</div>
+            </div>
+          </div>
+          <div class="metric-footer">
+            <span>最新首字(TTFT): <strong class="mono" id="statLatestTtft">-</strong></span>
+            <span>平均 TTFT: <strong class="mono" id="statAvgTtft">-</strong></span>
+          </div>
+        </div>
+
+        <!-- 卡片 4: Token 消耗结构 -->
+        <div class="metric-card">
+          <div class="metric-label">
+            <span>Token 消耗统计</span>
+            <span class="sub-pill mono" id="statCacheRate">缓存命中 -</span>
+          </div>
+          <div class="metric-dual">
+            <div>
+              <div class="dual-val mono" id="statOutTokens">0</div>
+              <div class="dual-cap">总输出 Token</div>
+            </div>
+            <div class="dual-divider"></div>
+            <div>
+              <div class="dual-val mono" id="statInTokens">0</div>
+              <div class="dual-cap">新增输入 Token</div>
+            </div>
+          </div>
+          <div class="metric-footer">
+            <span>思考/正文: <strong class="mono" id="statThinkContent">0 / 0</strong></span>
+            <span>缓存读取: <strong class="mono" id="statCachedTokens">0</strong></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 轮次端点与速率主表格区 -->
+      <section class="table-section">
+        <div class="table-toolbar">
+          <div class="toolbar-left">
+            <h3>轮次端点与速率明细</h3>
+            <span class="hint-text">点击任意行可展开该轮对应的提问与回答摘要</span>
+          </div>
+          <div class="toolbar-right">
+            <input
+              type="text"
+              id="turnSearch"
+              class="input-clean"
+              placeholder="筛选端点、提问、回复或工具..."
+            />
+            <button type="button" class="btn-clean btn-sm" id="sortOrderBtn">
+              ↓ 最新在前
+            </button>
+            <button type="button" class="btn-clean btn-sm" id="expandAllBtn">
+              展开全部
+            </button>
+          </div>
+        </div>
+
+        <div class="table-wrapper">
+          <table class="turns-table">
+            <thead>
+              <tr>
+                <th class="col-turn">轮次</th>
+                <th class="col-models">配置模型 ➔ 真实端点</th>
+                <th class="col-enum">内部枚举</th>
+                <th class="col-tps num">速率 (TPS)</th>
+                <th class="col-dur num">总耗时 (TTFT + 流式)</th>
+                <th class="col-in num">输入 (含缓存)</th>
+                <th class="col-out num">输出 (思考 / 正文)</th>
+                <th class="col-summary">交互摘要预览</th>
+              </tr>
+            </thead>
+            <tbody id="turnsTableBody">
+              <tr>
+                <td colspan="8" class="empty-cell">正在加载轮次数据...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden">已复制到剪贴板</div>
+  <script src="/app.js"></script>
+</body>
+</html>
