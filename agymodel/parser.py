@@ -1,6 +1,10 @@
 """
 Antigravity 会话数据库 (SQLite) 解析核心。
-同时解析 gen_metadata (端点、速率、Token 明细) 与 steps (提问/回答摘要)，精准关联每一轮推理。
+适配 Antigravity v2.29+：
+- 支持 WAL 实时修改时间检测 (.db-wal)
+- 支持读取全局 conversation_summaries.db 获取官方会话标题与子智能体标识
+- 支持解析多模态/带附件提问 (fn=19 -> sfn=2 & sfn=3) 及子智能体任务指令 (step_type=101)
+- 同时解析 gen_metadata (端点、速率、Token 明细) 与 steps (提问/回答摘要)
 """
 
 import glob
@@ -21,19 +25,24 @@ SEARCH_DIRS = [
     ("CLI", os.path.expanduser("~/.gemini/antigravity-cli/conversations")),
 ]
 
+SUMMARIES_DB_PATHS = [
+    os.path.expanduser("~/.gemini/antigravity/conversation_summaries.db"),
+    os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db"),
+]
+
 
 def open_db_safe(db_path: str) -> Tuple[Optional[sqlite3.Connection], Optional[str]]:
     """
     安全打开 SQLite 数据库，三级防锁死策略：
-    1. 标准只读连接 (PRAGMA query_only = ON)
+    1. 标准只读连接 (PRAGMA query_only = ON)，自动合并读取同目录 .db-wal 最新数据
     2. URI immutable=1 无锁模式
-    3. 临时文件快照模式
+    3. 临时文件快照模式 (连同 -wal / -shm 一并复制)
     """
     abs_path = os.path.abspath(db_path)
     if not os.path.exists(abs_path):
         return None, f"数据库文件不存在: {abs_path}"
 
-    # 策略 1: 常规连接 + query_only (兼容 WAL 实时读取)
+    # 策略 1: 常规连接 + query_only (兼容 WAL 实时读取最新未 checkpoint 的数据)
     try:
         conn = sqlite3.connect(abs_path, timeout=3.0)
         conn.execute("PRAGMA query_only = ON")
@@ -42,15 +51,7 @@ def open_db_safe(db_path: str) -> Tuple[Optional[sqlite3.Connection], Optional[s
     except Exception as e1:
         err1 = str(e1)
 
-    # 策略 2: immutable=1 模式
-    try:
-        conn = sqlite3.connect(f"file://{abs_path}?immutable=1", uri=True)
-        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
-        return conn, None
-    except Exception as e2:
-        err2 = str(e2)
-
-    # 策略 3: 临时快照读取
+    # 策略 2: 临时快照读取 (优先于 immutable=1，因为 immutable=1 会忽略 .db-wal 中的新数据)
     try:
         temp_dir = tempfile.gettempdir()
         temp_base = os.path.join(temp_dir, f"agymodel_snap_{os.path.basename(abs_path)}")
@@ -61,12 +62,63 @@ def open_db_safe(db_path: str) -> Tuple[Optional[sqlite3.Connection], Optional[s
                     shutil.copy2(abs_path + ext, temp_base + ext)
                 except OSError:
                     pass
-        conn = sqlite3.connect(temp_base)
+            elif os.path.exists(temp_base + ext):
+                try:
+                    os.remove(temp_base + ext)
+                except OSError:
+                    pass
+        conn = sqlite3.connect(temp_base, timeout=2.0)
         conn.execute("PRAGMA query_only = ON")
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        return conn, None
+    except Exception as e2:
+        err2 = str(e2)
+
+    # 策略 3: immutable=1 模式兜底
+    try:
+        conn = sqlite3.connect(f"file://{abs_path}?immutable=1", uri=True)
         conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
         return conn, None
     except Exception as e3:
         return None, f"打开数据库失败: {err1} / {err2} / {e3}"
+
+
+def load_summaries_index() -> Dict[str, Dict[str, Any]]:
+    """
+    从 Antigravity v2.29+ 新增的 conversation_summaries.db 中读取会话标题与元数据。
+    返回 {conversation_id: {"title": ..., "agent_name": ..., "parent_id": ...}}
+    """
+    index: Dict[str, Dict[str, Any]] = {}
+    for db_path in SUMMARIES_DB_PATHS:
+        if not os.path.exists(db_path):
+            continue
+        conn, _ = open_db_safe(db_path)
+        if not conn:
+            continue
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT conversation_id, title, preview, agent_name, parent_conversation_id "
+                "FROM conversation_summaries"
+            )
+            for cid, title, preview, agent_name, parent_id in cur.fetchall():
+                if not cid:
+                    continue
+                clean_title = (title or "").strip()
+                # 过滤掉异常策略报错文本作为标题的情况
+                if clean_title.startswith("The prompt could not be submitted"):
+                    clean_title = ""
+                index[cid] = {
+                    "title": clean_title,
+                    "preview": (preview or "").strip(),
+                    "agent_name": (agent_name or "").strip(),
+                    "parent_id": (parent_id or "").strip(),
+                }
+        except Exception:
+            pass
+        finally:
+            conn.close()
+    return index
 
 
 def clean_user_text(raw: str) -> str:
@@ -77,10 +129,56 @@ def clean_user_text(raw: str) -> str:
     m = re.search(r"<USER_REQUEST>([\s\S]*?)</USER_REQUEST>", text)
     if m:
         text = m.group(1).strip()
-    # 移除可能残留的元信息标签
     text = re.sub(r"<ADDITIONAL_METADATA>[\s\S]*?</ADDITIONAL_METADATA>", "", text)
     text = re.sub(r"<USER_SETTINGS_CHANGE>[\s\S]*?</USER_SETTINGS_CHANGE>", "", text)
     return text.strip()
+
+
+def _extract_user_text_from_fn19(val_bytes: bytes) -> str:
+    """
+    从 USER_INPUT (step_type=14) 的 fn=19 载荷中提取用户文本：
+    - 优先读取 sfn=2 (纯文本提问)
+    - 兼容读取 sfn=3 (带图片/文件引用时的多段内容结构)
+    """
+    sfn2_text = ""
+    sfn3_parts: List[str] = []
+
+    for sfn, swt, sval in parse_proto(val_bytes):
+        if sfn == 2 and swt == "bytes" and isinstance(sval, bytes):
+            cand = clean_user_text(decode_utf8(sval))
+            if cand:
+                sfn2_text = cand
+                break
+        elif sfn == 3 and swt == "bytes" and isinstance(sval, bytes):
+            # sfn=3 内部 field 1 为文本段落，field 2 为文件/图片 URI
+            sub = parse_proto(sval)
+            extracted_sub = False
+            for tf, tw, tv in sub:
+                if tf == 1 and tw == "bytes" and isinstance(tv, bytes):
+                    t_str = clean_user_text(decode_utf8(tv))
+                    if t_str and not t_str.startswith("file://"):
+                        sfn3_parts.append(t_str)
+                        extracted_sub = True
+            if not extracted_sub:
+                raw_str = clean_user_text(decode_utf8(sval))
+                # 去除头尾可能的控制字符
+                raw_str = re.sub(r"^[\x00-\x1f]+", "", raw_str).strip()
+                if raw_str and not raw_str.startswith("file://"):
+                    sfn3_parts.append(raw_str)
+
+    if sfn2_text:
+        return sfn2_text
+    return " ".join(sfn3_parts).strip()
+
+
+def _extract_subagent_prompt_from_fn114(val_bytes: bytes) -> str:
+    """从子智能体消息 (step_type=101, fn=114) 中提取任务描述。"""
+    for sfn, swt, sval in parse_proto(val_bytes):
+        if sfn == 1 and swt == "bytes" and isinstance(sval, bytes):
+            txt = decode_utf8(sval)
+            m = re.search(r"content=([\s\S]+)$", txt)
+            return (m.group(1) if m else txt).strip()
+    return ""
 
 
 def parse_gen_metadata_row(data: bytes) -> Dict[str, Any]:
@@ -185,12 +283,10 @@ def parse_gen_metadata_row(data: bytes) -> Dict[str, Any]:
                 elif sfn == 12 and swt == "bytes" and isinstance(sval, bytes):
                     f12_sec = parse_duration(sval)
 
-    # Field 11 为 TTFT，Field 12 为流式传输耗时，两者之和为端到端总耗时
     info["ttft_seconds"] = f11_sec
     info["stream_seconds"] = f12_sec
     info["duration_seconds"] = round(f11_sec + f12_sec, 3)
 
-    # 计算 TPS (端到端速率 & 流式解码速率)
     out_tok = info["output_tokens"]
     dur = info["duration_seconds"]
     if out_tok > 0 and dur > 0:
@@ -200,7 +296,6 @@ def parse_gen_metadata_row(data: bytes) -> Dict[str, Any]:
         else:
             info["streaming_tps"] = info["tps"]
 
-    # 兜底正则提取 backend_model
     if not info["backend_model"]:
         m_back = re.search(rb"\x9a\x01[\x01-\x3f]([a-zA-Z0-9\.\-]+)", data)
         if m_back:
@@ -210,7 +305,7 @@ def parse_gen_metadata_row(data: bytes) -> Dict[str, Any]:
 
 
 def _parse_tool_call_brief(raw_bytes: bytes) -> Optional[Dict[str, str]]:
-    """解析 steps 中 Field 20 -> Field 7 的工具调用摘要 (只提取工具名与关键参数摘要)。"""
+    """解析 steps 中 Field 20 -> Field 7 的工具调用摘要。"""
     name = ""
     args_raw = ""
     for fn, wt, val in parse_proto(raw_bytes):
@@ -243,7 +338,7 @@ def _parse_tool_call_brief(raw_bytes: bytes) -> Optional[Dict[str, str]]:
 
 def parse_steps_context(conn: sqlite3.Connection) -> Tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     """
-    从 steps 表读取用户提问 (step_type=14) 与模型响应 (step_type=15)，
+    从 steps 表读取用户提问 (step_type=14 / 101) 与模型响应 (step_type=15)，
     返回: (user_steps_list, planner_by_turn_idx, planner_by_bot_id)
     """
     user_steps: List[Dict[str, Any]] = []
@@ -256,7 +351,7 @@ def parse_steps_context(conn: sqlite3.Connection) -> Tuple[List[Dict[str, Any]],
         if not cur.fetchone():
             return user_steps, planner_by_turn, planner_by_bot
 
-        cur.execute("SELECT idx, step_type, step_payload FROM steps WHERE step_type IN (14, 15) ORDER BY idx ASC")
+        cur.execute("SELECT idx, step_type, step_payload FROM steps WHERE step_type IN (14, 15, 101) ORDER BY idx ASC")
         rows = cur.fetchall()
     except Exception:
         return user_steps, planner_by_turn, planner_by_bot
@@ -274,7 +369,6 @@ def parse_steps_context(conn: sqlite3.Connection) -> Tuple[List[Dict[str, Any]],
                     if sfn == 1 and swt == "bytes" and isinstance(sval, bytes):
                         ts = parse_timestamp(sval)
                     elif sfn == 20 and swt == "bytes" and isinstance(sval, bytes):
-                        # Field 3 in sfn=20 stores gen_metadata turn index (0 is omitted in proto3 varint)
                         found_turn = 0
                         for mfn, mwt, mval in parse_proto(sval):
                             if mfn == 3 and mwt == "varint" and isinstance(mval, int):
@@ -287,11 +381,9 @@ def parse_steps_context(conn: sqlite3.Connection) -> Tuple[List[Dict[str, Any]],
             user_text = ""
             for fn, wt, val in outer:
                 if fn == 19 and wt == "bytes" and isinstance(val, bytes):
-                    for sfn, swt, sval in parse_proto(val):
-                        if sfn == 2 and swt == "bytes" and isinstance(sval, bytes):
-                            user_text = clean_user_text(decode_utf8(sval))
-                            if user_text:
-                                break
+                    user_text = _extract_user_text_from_fn19(val)
+                    if user_text:
+                        break
             if user_text:
                 user_steps.append({
                     "step_index": step_idx,
@@ -299,6 +391,19 @@ def parse_steps_context(conn: sqlite3.Connection) -> Tuple[List[Dict[str, Any]],
                     "time_str": time_str,
                     "text": user_text,
                 })
+
+        elif step_type == 101 and not user_steps:  # Subagent 初始输入指令
+            for fn, wt, val in outer:
+                if fn == 114 and wt == "bytes" and isinstance(val, bytes):
+                    sub_text = _extract_subagent_prompt_from_fn114(val)
+                    if sub_text:
+                        user_steps.append({
+                            "step_index": step_idx,
+                            "timestamp": ts,
+                            "time_str": time_str,
+                            "text": f"[子智能体任务] {sub_text}",
+                        })
+                        break
 
         elif step_type == 15:  # PLANNER_RESPONSE
             reply_text = ""
@@ -339,34 +444,55 @@ def parse_steps_context(conn: sqlite3.Connection) -> Tuple[List[Dict[str, Any]],
 
 
 def extract_first_user_title(conn: sqlite3.Connection) -> str:
-    """快速提取会话第一条用户提问作为可读标题。"""
+    """快速提取会话第一条用户提问作为可读标题（兼容纯文本 sfn=2、多模态 sfn=3 与子智能体 step_type=101）。"""
     try:
         cur = conn.cursor()
-        cur.execute("SELECT step_payload FROM steps WHERE step_type = 14 ORDER BY idx ASC LIMIT 1")
-        row = cur.fetchone()
-        if not row or not row[0]:
-            return ""
-        for fn, wt, val in parse_proto(row[0]):
-            if fn == 19 and wt == "bytes" and isinstance(val, bytes):
-                for sfn, swt, sval in parse_proto(val):
-                    if sfn == 2 and swt == "bytes" and isinstance(sval, bytes):
-                        txt = clean_user_text(decode_utf8(sval))
-                        if txt:
-                            first_line = txt.splitlines()[0].strip()
-                            return first_line[:64] + ("..." if len(first_line) > 64 else "")
+        cur.execute("SELECT step_type, step_payload FROM steps WHERE step_type IN (14, 101) ORDER BY idx ASC LIMIT 3")
+        for step_type, payload in cur.fetchall():
+            if not payload:
+                continue
+            for fn, wt, val in parse_proto(payload):
+                if step_type == 14 and fn == 19 and wt == "bytes" and isinstance(val, bytes):
+                    txt = _extract_user_text_from_fn19(val)
+                    if txt:
+                        first_line = txt.splitlines()[0].strip()
+                        return first_line[:64] + ("..." if len(first_line) > 64 else "")
+                elif step_type == 101 and fn == 114 and wt == "bytes" and isinstance(val, bytes):
+                    txt = _extract_subagent_prompt_from_fn114(val)
+                    if txt:
+                        first_line = txt.splitlines()[0].strip()
+                        return f"[子智能体] {first_line[:56]}" + ("..." if len(first_line) > 56 else "")
     except Exception:
         pass
     return ""
 
 
+def _get_effective_mtime(db_file: str) -> float:
+    """
+    获取会话数据库真实最后修改时间：
+    兼顾主文件 .db 与 WAL 日志文件 .db-wal（当 .db-wal 非空时取两者最大值）。
+    """
+    mtime = os.path.getmtime(db_file)
+    wal_file = db_file + "-wal"
+    if os.path.exists(wal_file):
+        try:
+            if os.path.getsize(wal_file) > 0:
+                wal_mtime = os.path.getmtime(wal_file)
+                if wal_mtime > mtime:
+                    mtime = wal_mtime
+        except OSError:
+            pass
+    return mtime
+
+
 def scan_all_conversations() -> List[Dict[str, Any]]:
-    """扫描所有 Antigravity (App 与 CLI) 会话数据库并按修改时间降序排列。"""
+    """扫描所有 Antigravity (App 与 CLI) 会话数据库并按实际修改时间降序排列。"""
     convs: List[Dict[str, Any]] = []
     for source, sdir in SEARCH_DIRS:
         if os.path.exists(sdir):
             for db_file in glob.glob(os.path.join(sdir, "*.db")):
                 try:
-                    mtime = os.path.getmtime(db_file)
+                    mtime = _get_effective_mtime(db_file)
                     cid = Path(db_file).stem
                     convs.append({
                         "id": cid,
@@ -381,18 +507,40 @@ def scan_all_conversations() -> List[Dict[str, Any]]:
     return convs
 
 
-def list_conversations_summary(limit: int = 40) -> List[Dict[str, Any]]:
-    """获取最近会话摘要列表（包含会话标题、轮次数、最新端点与速率）。"""
-    convs = scan_all_conversations()[:limit]
+def list_conversations_summary(limit: int = 60) -> List[Dict[str, Any]]:
+    """
+    获取最近会话摘要列表。
+    同时保证 App 与 CLI 来源均有覆盖，并结合 conversation_summaries.db 补全标题。
+    """
+    all_convs = scan_all_conversations()
+    summaries_idx = load_summaries_index()
+
+    # 选取前 limit 条，若其中没有 CLI 会话则额外补充最近 10 条 CLI 会话，确保前端切换 CLI 筛选时不为空
+    selected = all_convs[:limit]
+    selected_ids = {c["id"] for c in selected}
+    cli_count = sum(1 for c in selected if c["source"] == "CLI")
+    if cli_count < 10:
+        for c in all_convs[limit:]:
+            if c["source"] == "CLI" and c["id"] not in selected_ids:
+                selected.append(c)
+                selected_ids.add(c["id"])
+                cli_count += 1
+                if cli_count >= 10:
+                    break
+
     results: List[Dict[str, Any]] = []
 
-    for c in convs:
+    for c in selected:
+        cid = c["id"]
         turn_count = 0
         latest_endpoint = "未知"
         client_model = "-"
         model_enum = "-"
         latest_tps = 0.0
         title = ""
+
+        s_meta = summaries_idx.get(cid) or {}
+        agent_name = s_meta.get("agent_name") or ""
 
         conn, _ = open_db_safe(c["path"])
         if conn:
@@ -402,26 +550,40 @@ def list_conversations_summary(limit: int = 40) -> List[Dict[str, Any]]:
                 cur.execute("SELECT count(*) FROM gen_metadata")
                 turn_count = cur.fetchone()[0]
                 if turn_count > 0:
-                    cur.execute("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1")
-                    row = cur.fetchone()
-                    if row and row[0]:
-                        meta = parse_gen_metadata_row(row[0])
-                        latest_endpoint = meta.get("backend_model") or "未知"
-                        client_model = meta.get("client_model") or "-"
-                        model_enum = meta.get("model_enum") or "-"
-                        latest_tps = meta.get("tps") or 0.0
+                    # 取最近 5 条以防最后一条正在生成或中断导致字段为空
+                    cur.execute("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 5")
+                    for (raw_data,) in cur.fetchall():
+                        if not raw_data:
+                            continue
+                        meta = parse_gen_metadata_row(raw_data)
+                        if client_model == "-" and meta.get("client_model"):
+                            client_model = meta["client_model"]
+                        if model_enum == "-" and meta.get("model_enum"):
+                            model_enum = meta["model_enum"]
+                        if latest_endpoint == "未知" and meta.get("backend_model"):
+                            latest_endpoint = meta["backend_model"]
+                            latest_tps = meta.get("tps") or 0.0
+                        if latest_endpoint != "未知" and client_model != "-":
+                            break
             except Exception:
                 pass
             finally:
                 conn.close()
 
+        # 若 steps 中未提取到标题，回退使用 conversation_summaries.db 中的官方标题
+        if not title and s_meta.get("title"):
+            title = s_meta["title"]
+        if not title and agent_name:
+            title = f"[{agent_name}] 子智能体会话 {cid[:8]}"
+
         results.append({
-            "id": c["id"],
+            "id": cid,
             "source": c["source"],
             "path": c["path"],
             "mtime": c["mtime"],
             "updated_at": c["updated_at"],
-            "title": title or f"会话 {c['id'][:8]}",
+            "title": title or f"会话 {cid[:8]}",
+            "agent_name": agent_name,
             "turn_count": turn_count,
             "backend_endpoint": latest_endpoint,
             "client_model": client_model,
@@ -440,7 +602,7 @@ def inspect_conversation(target: Optional[str] = None, preferred_source: Optiona
     selected: Optional[Dict[str, Any]] = None
 
     if target and os.path.exists(target):
-        mtime = os.path.getmtime(target)
+        mtime = _get_effective_mtime(target)
         selected = {
             "id": Path(target).stem,
             "source": preferred_source or "File",
@@ -496,7 +658,6 @@ def inspect_conversation(target: Optional[str] = None, preferred_source: Optiona
         turns.append(t)
 
     # 回填被 Antigravity 裁剪的历史轮次 client_model
-    # (Antigravity 仅在最新轮次保留 Field 3 请求配置，同会话同端点的历史轮次可继承显示)
     known_client_by_enum: Dict[str, str] = {}
     fallback_client: Optional[str] = None
     for t in reversed(turns):
@@ -522,10 +683,8 @@ def inspect_conversation(target: Optional[str] = None, preferred_source: Optiona
         bot_id = t.get("bot_id")
         last_step = t.get("last_step_index")
 
-        # 优先通过 bot_id 精确匹配，其次通过 turn_index 匹配
         p_step = (planner_by_bot.get(bot_id) if bot_id else None) or planner_by_turn.get(idx)
 
-        # 查找触发当前轮次的最近一条用户输入
         u_step = None
         is_direct_user_turn = False
         if user_steps:
@@ -550,7 +709,6 @@ def inspect_conversation(target: Optional[str] = None, preferred_source: Optiona
             "tools": p_step["tools"] if p_step else [],
         }
 
-    # 汇总统计指标
     total_prompt = sum(t["prompt_tokens"] for t in turns)
     total_cached = sum(t["cached_tokens"] for t in turns)
     total_output = sum(t["output_tokens"] for t in turns)
@@ -574,8 +732,20 @@ def inspect_conversation(target: Optional[str] = None, preferred_source: Optiona
         if ep and ep not in unique_endpoints:
             unique_endpoints.append(ep)
 
-    latest = turns[-1] if turns else {}
-    first_title = user_steps[0]["text"].splitlines()[0][:64] if user_steps else f"会话 {selected['id'][:8]}"
+    # 查找最近一条包含有效 backend_model 的轮次作为顶部状态展示
+    latest_valid = turns[-1] if turns else {}
+    for t in reversed(turns):
+        if t.get("backend_model"):
+            latest_valid = t
+            break
+
+    summaries_idx = load_summaries_index()
+    s_meta = summaries_idx.get(selected["id"]) or {}
+    first_title = (
+        user_steps[0]["text"].splitlines()[0][:64]
+        if user_steps
+        else (s_meta.get("title") or f"会话 {selected['id'][:8]}")
+    )
 
     return {
         "id": selected["id"],
@@ -586,20 +756,20 @@ def inspect_conversation(target: Optional[str] = None, preferred_source: Optiona
         "title": first_title,
         "summary": {
             "total_turns": len(turns),
-            "client_model": latest.get("client_model") or "默认/未捕获",
-            "backend_endpoint": latest.get("backend_model") or "未知",
-            "model_enum": latest.get("model_enum") or "未知",
-            "used_non_gemini": bool(latest.get("used_non_gemini")),
+            "client_model": latest_valid.get("client_model") or "默认/未捕获",
+            "backend_endpoint": latest_valid.get("backend_model") or "未知",
+            "model_enum": latest_valid.get("model_enum") or "未知",
+            "used_non_gemini": bool(latest_valid.get("used_non_gemini")),
             "unique_endpoints": unique_endpoints,
             "endpoint_consistent": len(unique_endpoints) <= 1,
-            "latest_tps": latest.get("tps") or 0.0,
-            "latest_streaming_tps": latest.get("streaming_tps") or 0.0,
+            "latest_tps": latest_valid.get("tps") or 0.0,
+            "latest_streaming_tps": latest_valid.get("streaming_tps") or 0.0,
             "avg_tps": avg_tps,
             "avg_streaming_tps": avg_stream_tps,
             "peak_tps": peak_tps,
-            "latest_duration": latest.get("duration_seconds") or 0.0,
+            "latest_duration": latest_valid.get("duration_seconds") or 0.0,
             "total_duration": total_duration,
-            "latest_ttft": latest.get("ttft_seconds") or 0.0,
+            "latest_ttft": latest_valid.get("ttft_seconds") or 0.0,
             "avg_ttft": avg_ttft,
             "total_prompt_tokens": total_prompt,
             "total_cached_tokens": total_cached,

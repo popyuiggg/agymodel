@@ -118,7 +118,10 @@ function startPolling() {
 
 async function fetchConversationsList(forceDetail = false) {
   try {
-    const res = await fetch("/api/conversations?limit=40");
+    const res = await fetch("/api/conversations?limit=60", { cache: "no-store" });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
     const list = await res.json();
     if (!Array.isArray(list)) return;
 
@@ -140,6 +143,12 @@ async function fetchConversationsList(forceDetail = false) {
     }
   } catch (err) {
     console.error("获取会话列表失败:", err);
+    if (state.conversations.length === 0) {
+      const container = document.getElementById("convList");
+      if (container) {
+        container.innerHTML = `<div class="empty-hint">后台检测服务未响应 (${escapeHtml(err.message || "连接断开")})<br/>正在自动重连...</div>`;
+      }
+    }
   }
 }
 
